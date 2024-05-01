@@ -3,7 +3,6 @@ import {
   Bytes,
   BigInt,
   Address,
-  ipfs,
   json,
   JSONValue,
   JSONValueKind,
@@ -277,6 +276,7 @@ function JSONValueToBool(
 }
 
 export function handleNewItem(event: NewItem): void {
+  
   // We assume this is an item added via addItemDirectly and care
   // only about saving the item json data.
   // If it was emitted via addItem, all the missing/wrong data regarding
@@ -298,6 +298,7 @@ export function handleNewItem(event: NewItem): void {
 
   let item = new LItem(graphItemID);
   item.itemID = event.params._itemID;
+  item.data = event.params._data
   item.data = event.params._data;
   item.numberOfRequests = BigInt.fromI32(0);
   item.registry = registry.id;
@@ -308,200 +309,7 @@ export function handleNewItem(event: NewItem): void {
   item.latestChallenger = ZERO_ADDRESS;
   item.latestRequestResolutionTime = BigInt.fromI32(0);
   item.latestRequestSubmissionTime = BigInt.fromI32(0);
-
-  item.keywords = event.address.toHexString();
-
-  // Offchain item data could be unavailable. We cannot let
-  // this handler fail otherwise an item would pass the challenge
-  // period unnoticed. Instead we set dummy data so challengers
-  // have a chance to check this.
-  let jsonStr = ipfs.cat(item.data);
-  if (!jsonStr) {
-    log.error('Failed to fetch item #{} JSON: {}', [graphItemID, item.data]);
-    item.save();
-    registry.save();
-    return;
-  }
-
-  let jsonObjValueAndSuccess = json.try_fromBytes(jsonStr as Bytes);
-  if (!jsonObjValueAndSuccess.isOk) {
-    log.error(`Error getting json object value for graphItemID {}`, [
-      graphItemID,
-    ]);
-    item.save();
-    registry.save();
-    return;
-  }
-
-  let jsonObj = jsonObjValueAndSuccess.value.toObject();
-  if (!jsonObj) {
-    log.error(`Error converting object for graphItemID {}`, [graphItemID]);
-    item.save();
-    registry.save();
-    return;
-  }
-
-  let columnsValue = jsonObj.get('columns');
-  if (!columnsValue) {
-    log.error(`Error getting column values for graphItemID {}`, [graphItemID]);
-    item.save();
-    registry.save();
-    return;
-  }
-  let columns = columnsValue.toArray();
-
-  let valuesValue = jsonObj.get('values');
-  if (!valuesValue) {
-    log.error(`Error getting valuesValue for graphItemID {}`, [graphItemID]);
-    item.save();
-    registry.save();
-    return;
-  }
-  let values = valuesValue.toObject();
-
-  let identifier = 0;
-  for (let i = 0; i < columns.length; i++) {
-    let col = columns[i];
-    let colObj = col.toObject();
-
-    let label = colObj.get('label');
-
-    // We must account for items with missing fields.
-    let checkedLabel = label
-      ? label.toString()
-      : 'missing-label'.concat(i.toString());
-
-    let description = colObj.get('description');
-    let _type = colObj.get('type');
-    let isIdentifier = colObj.get('isIdentifier');
-    let value = values.get(checkedLabel);
-    let itemPropId = graphItemID + '@' + checkedLabel;
-    let itemProp = new ItemProp(itemPropId);
-
-    itemProp.value = JSONValueToMaybeString(value);
-    itemProp.type = JSONValueToMaybeString(_type);
-    itemProp.label = JSONValueToMaybeString(label);
-    itemProp.description = JSONValueToMaybeString(description);
-    itemProp.isIdentifier = JSONValueToBool(isIdentifier);
-    itemProp.item = item.id;
-
-    if (itemProp.isIdentifier) {
-      if (identifier == 0) item.key0 = itemProp.value;
-      else if (identifier == 1) item.key1 = itemProp.value;
-      else if (identifier == 2) item.key2 = itemProp.value;
-      else if (identifier == 3) item.key3 = itemProp.value;
-      else if (identifier == 4) item.key4 = itemProp.value;
-      identifier += 1;
-    }
-
-    if (itemProp.isIdentifier && itemProp.value != null && item.keywords) {
-      item.keywords =
-        (item.keywords as string) + ' | ' + (itemProp.value as string);
-    }
-
-    itemProp.save();
-  }
-
-  item.save();
-  registry.save();
-}
-
-export function handleRequestSubmitted(event: RequestSubmitted): void {
-  let graphItemID =
-    event.params._itemID.toHexString() + '@' + event.address.toHexString();
-
-  let tcr = LightGeneralizedTCR.bind(event.address);
-  let itemInfo = tcr.getItemInfo(event.params._itemID);
-  let item = LItem.load(graphItemID);
-  if (!item) {
-    log.error(`LItem for graphItemID {} not found.`, [graphItemID]);
-    return;
-  }
-
-  let registry = LRegistry.load(event.address.toHexString());
-  if (!registry) {
-    log.error(`LRegistry at address {} not found`, [
-      event.address.toHexString(),
-    ]);
-    return;
-  }
-  // `previousStatus` and `newStatus` are used for accounting.
-  // Note that if this is the very first request of an item,
-  // item.status and item.dispute are dirty because they were set by
-  // handleNewItem, executed before this handler and so `previousStatus`
-  // would be wrong. We use a condition to detect if its the very
-  // first request and if so, ignore its contents (see below in accounting).
-  let previousStatus = getExtendedStatus(item.disputed, item.status);
-
-  item.numberOfRequests = item.numberOfRequests.plus(BigInt.fromI32(1));
-  item.status = getStatus(itemInfo.value0);
-  item.latestRequester = event.transaction.from;
-  item.latestRequestResolutionTime = BigInt.fromI32(0);
-  item.latestRequestSubmissionTime = event.block.timestamp;
-
-  let newStatus = getExtendedStatus(item.disputed, item.status);
-
-  let requestIndex = item.numberOfRequests.minus(BigInt.fromI32(1));
-  let requestID = graphItemID + '-' + requestIndex.toString();
-
-  let request = new LRequest(requestID);
-  request.disputed = false;
-  request.arbitrator = tcr.arbitrator();
-  request.arbitratorExtraData = tcr.arbitratorExtraData();
-  request.challenger = ZERO_ADDRESS;
-  request.requester = event.transaction.from;
-  request.item = item.id;
-  request.registry = registry.id;
-  request.registryAddress = event.address;
-  request.resolutionTime = BigInt.fromI32(0);
-  request.disputeOutcome = NONE;
-  request.resolved = false;
-  request.disputeID = BigInt.fromI32(0);
-  request.submissionTime = event.block.timestamp;
-  request.numberOfRounds = BigInt.fromI32(1);
-  request.requestType = item.status;
-
-  // Handle the evidenceGroup situation. It might already exist
-  let evidenceGroupId =
-    event.params._evidenceGroupID.toString() +
-    '@' +
-    event.address.toHexString();
-  let evidenceGroup = EvidenceGroup.load(evidenceGroupId);
-  if (!evidenceGroup) {
-    evidenceGroup = new EvidenceGroup(evidenceGroupId);
-    evidenceGroup.numberOfEvidence = BigInt.fromI32(0);
-    evidenceGroup.save();
-  }
-
-  request.evidenceGroup = evidenceGroupId;
-
-  request.creationTx = event.transaction.hash;
-  if (request.requestType == REGISTRATION_REQUESTED) {
-    request.deposit = tcr.submissionBaseDeposit();
-    request.metaEvidence = registry.registrationMetaEvidence;
-  } else {
-    request.deposit = tcr.removalBaseDeposit();
-    request.metaEvidence = registry.clearingMetaEvidence;
-  }
-  let roundID = requestID + '-0';
-
-  // Note that everything related to the deposit (e.g. contribution creation)
-  // is handled in handleContribution.
-  let round = buildNewRound(roundID, requestID, event.block.timestamp);
-
-  // Accounting.
-  if (itemInfo.value1.equals(BigInt.fromI32(1))) {
-    // This is the first request for this item, which must be
-    // a registration request.
-    registry.numberOfRegistrationRequested = registry.numberOfRegistrationRequested.plus(
-      BigInt.fromI32(1),
-    );
-  } else {
-    updateCounters(previousStatus, newStatus, event.address);
-  }
-
-  round.save();
-  request.save();
+  
   item.save();
   registry.save();
 }
