@@ -313,7 +313,108 @@ export function handleNewItem(event: NewItem): void {
   item.save();
   registry.save();
 }
+export function handleRequestSubmitted(event: RequestSubmitted): void {
+  let graphItemID =
+    event.params._itemID.toHexString() + '@' + event.address.toHexString();
 
+  let tcr = LightGeneralizedTCR.bind(event.address);
+  let itemInfo = tcr.getItemInfo(event.params._itemID);
+  let item = LItem.load(graphItemID);
+  if (!item) {
+    log.error(`LItem for graphItemID {} not found.`, [graphItemID]);
+    return;
+  }
+
+  let registry = LRegistry.load(event.address.toHexString());
+  if (!registry) {
+    log.error(`LRegistry at address {} not found`, [
+      event.address.toHexString(),
+    ]);
+    return;
+  }
+  // `previousStatus` and `newStatus` are used for accounting.
+  // Note that if this is the very first request of an item,
+  // item.status and item.dispute are dirty because they were set by
+  // handleNewItem, executed before this handler and so `previousStatus`
+  // would be wrong. We use a condition to detect if its the very
+  // first request and if so, ignore its contents (see below in accounting).
+  
+
+  let previousStatus = getExtendedStatus(item.disputed, item.status);
+
+  item.numberOfRequests = item.numberOfRequests.plus(BigInt.fromI32(1));
+  item.status = getStatus(itemInfo.value0);
+  item.latestRequester = event.transaction.from;
+  item.latestRequestResolutionTime = BigInt.fromI32(0);
+  item.latestRequestSubmissionTime = event.block.timestamp;
+
+  let newStatus = getExtendedStatus(item.disputed, item.status);
+
+  let requestIndex = item.numberOfRequests.minus(BigInt.fromI32(1));
+  let requestInfo = tcr.getRequestInfo(event.params._itemID, requestIndex);
+  let requestID = graphItemID + '-' + requestIndex.toString();
+
+  let request = new LRequest(requestID);
+  request.disputed = false;
+  request.arbitrator = tcr.arbitrator();
+  request.arbitratorExtraData = tcr.arbitratorExtraData();
+  request.challenger = ZERO_ADDRESS;
+  request.requester = requestInfo.value4[1];
+  request.item = item.id;
+  request.registry = registry.id;
+  request.registryAddress = event.address;
+  request.resolutionTime = BigInt.fromI32(0);
+  request.disputeOutcome = NONE;
+  request.resolved = false;
+  request.disputeID = BigInt.fromI32(0);
+  request.submissionTime = event.block.timestamp;
+  request.numberOfRounds = BigInt.fromI32(1);
+  request.requestType = item.status;
+
+  // Handle the evidenceGroup situation. It might already exist
+  let evidenceGroupId =
+    event.params._evidenceGroupID.toString() +
+    '@' +
+    event.address.toHexString();
+  let evidenceGroup = EvidenceGroup.load(evidenceGroupId);
+  if (!evidenceGroup) {
+    evidenceGroup = new EvidenceGroup(evidenceGroupId);
+    evidenceGroup.numberOfEvidence = BigInt.fromI32(0);
+    evidenceGroup.save();
+  }
+
+  request.evidenceGroup = evidenceGroupId;
+
+  request.creationTx = event.transaction.hash;
+  if (request.requestType == REGISTRATION_REQUESTED) {
+    request.deposit = tcr.submissionBaseDeposit();
+    request.metaEvidence = registry.registrationMetaEvidence;
+  } else {
+    request.deposit = tcr.removalBaseDeposit();
+    request.metaEvidence = registry.clearingMetaEvidence;
+  }
+  let roundID = requestID + '-0';
+
+  // Note that everything related to the deposit (e.g. contribution creation)
+  // is handled in handleContribution.
+  let round = buildNewRound(roundID, requestID, event.block.timestamp);
+
+  // Accounting.
+  if (itemInfo.value1.equals(BigInt.fromI32(1))) {
+    // This is the first request for this item, which must be
+    // a registration request.
+    registry.numberOfRegistrationRequested = registry.numberOfRegistrationRequested.plus(
+      BigInt.fromI32(1),
+    );
+  } else {
+    updateCounters(previousStatus, newStatus, event.address);
+  }
+
+  round.save();
+  request.save();
+  item.save();
+  registry.save();
+}
 export function handleContribution(event: Contribution): void {
   // This handler is triggered in 3 situations:
   // - When a user places a request
